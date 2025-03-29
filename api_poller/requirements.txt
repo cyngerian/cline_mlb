@@ -1,2 +1,6 @@
 requests
 kafka-python
+
+# Testing
+pytest
+pytest-mock
