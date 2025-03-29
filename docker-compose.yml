@@ -144,4 +144,26 @@ services:
       - stats_network
     restart: on-failure # Restart if the poller crashes
 
-# Add services for rt_transformer, api_service later
+  rt_transformer:
+    build:
+      context: ./rt_transformer
+      dockerfile: Dockerfile
+    container_name: rt_transformer
+    depends_on:
+      - kafka
+      - postgres # Transformer needs DB to be ready
+    environment:
+      KAFKA_BROKER: kafka:9092
+      KAFKA_TOPIC: live_game_data
+      KAFKA_GROUP_ID: rt_transformer_group
+      DB_USER: statsuser
+      DB_PASSWORD: statspassword
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      DB_NAME: baseball_stats
+      # Add any other necessary env vars
+    networks:
+      - stats_network
+    restart: on-failure
+
+# Add services for api_service later
