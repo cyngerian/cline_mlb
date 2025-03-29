@@ -166,4 +166,22 @@ services:
       - stats_network
     restart: on-failure
 
-# Add services for api_service later
+  api_service:
+    build:
+      context: ./api_service
+      dockerfile: Dockerfile
+    container_name: api_service
+    depends_on:
+      - postgres # API needs DB to be ready
+    ports:
+      - "8000:8000" # Map container port 8000 to host port 8000
+    environment:
+      DB_USER: statsuser
+      DB_PASSWORD: statspassword
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      DB_NAME: baseball_stats
+      # Add any other necessary env vars (e.g., for external APIs if needed)
+    networks:
+      - stats_network
+    restart: on-failure
