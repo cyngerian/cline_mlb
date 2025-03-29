@@ -1,0 +1,7 @@
+requests
+kafka-python
+boto3
+
+# Testing
+pytest
+pytest-mock
