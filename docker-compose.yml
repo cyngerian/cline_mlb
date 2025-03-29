@@ -1,0 +1,187 @@
+version: '3.8'
+
+volumes:
+  postgres_data:
+  raw_json_data:
+  airflow_dags:
+  airflow_logs:
+  airflow_plugins:
+  kafka_data:
+  zookeeper_data:
+  zookeeper_log:
+
+networks:
+  stats_network:
+    driver: bridge
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.3.2
+    hostname: zookeeper
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
+    networks:
+      - stats_network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.3.2
+    hostname: kafka
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      # Exposes internal Kafka port 9092 to host port 9092
+      - "9092:9092"
+      # Exposes internal Kafka port 29092 used for external connections from host
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      # Listeners configuration:
+      # LISTENER_INTERNAL is for communication within the Docker network
+      # LISTENER_EXTERNAL is for communication from the host machine (your dev environment)
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: LISTENER_INTERNAL:PLAINTEXT,LISTENER_EXTERNAL:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: LISTENER_INTERNAL://kafka:9092,LISTENER_EXTERNAL://localhost:29092
+      KAFKA_INTER_BROKER_LISTENER_NAME: LISTENER_INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_CONFLUENT_LICENSE_TOPIC_REPLICATION_FACTOR: 1 # Confluent specific
+      KAFKA_CONFLUENT_BALANCER_TOPIC_REPLICATION_FACTOR: 1 # Confluent specific
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1 # Confluent specific
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1 # Confluent specific
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - stats_network
+
+  postgres:
+    image: postgres:15
+    hostname: postgres
+    container_name: postgres
+    environment:
+      POSTGRES_USER: statsuser
+      POSTGRES_PASSWORD: statspassword # Consider using secrets in a real setup
+      POSTGRES_DB: baseball_stats
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - stats_network
+
+  # Basic Airflow setup (can be refined later)
+  # Uses puckel/docker-airflow image for simplicity initially
+  # For production, consider the official Apache Airflow image and setup
+  airflow-scheduler:
+    image: puckel/docker-airflow:1.10.9 # Using an older, simpler image for initial setup
+    container_name: airflow_scheduler
+    depends_on:
+      - postgres
+    environment:
+      - LOAD_EX=n
+      - EXECUTOR=Local # Use LocalExecutor for simplicity first
+      - POSTGRES_USER=statsuser
+      - POSTGRES_PASSWORD=statspassword
+      - POSTGRES_DB=baseball_stats
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      # Set AIRFLOW_UID to host user's UID to avoid permission issues with DAGs volume
+      # On Windows, this might need adjustment or running Docker Desktop with WSL2 backend
+      # For now, commenting out - might need manual permission fixes on volume mounts
+      # - AIRFLOW_UID= # Needs your host user ID
+    volumes:
+      - ./airflow_dags:/usr/local/airflow/dags
+      # - ./airflow_plugins:/usr/local/airflow/plugins # If needed later
+      - airflow_logs:/usr/local/airflow/logs
+    networks:
+      - stats_network
+    command: scheduler
+
+  airflow-webserver:
+    image: puckel/docker-airflow:1.10.9
+    container_name: airflow_webserver
+    restart: always
+    depends_on:
+      - airflow-scheduler
+    ports:
+      - "8080:8080"
+    environment:
+      - LOAD_EX=n
+      - EXECUTOR=Local
+      # - AIRFLOW_UID= # Needs your host user ID
+    volumes:
+      - ./airflow_dags:/usr/local/airflow/dags
+      # - ./airflow_plugins:/usr/local/airflow/plugins
+      - airflow_logs:/usr/local/airflow/logs
+    networks:
+      - stats_network
+    command: webserver
+
+  api_poller:
+    build:
+      context: ./api_poller
+      dockerfile: Dockerfile
+    container_name: api_poller
+    depends_on:
+      - kafka # Ensure Kafka is running before the poller starts
+    volumes:
+      # Mount the named volume for storing raw JSON files
+      - raw_json_data:/data/raw_json
+    environment:
+      # Pass Kafka broker address (using service name from Docker network)
+      KAFKA_BROKER: kafka:9092
+      KAFKA_TOPIC: live_game_data
+      RAW_DATA_PATH: /data/raw_json # Path inside the container where the volume is mounted
+      # Add any other necessary env vars like API keys if needed later
+    networks:
+      - stats_network
+    restart: on-failure # Restart if the poller crashes
+
+  rt_transformer:
+    build:
+      context: ./rt_transformer
+      dockerfile: Dockerfile
+    container_name: rt_transformer
+    depends_on:
+      - kafka
+      - postgres # Transformer needs DB to be ready
+    environment:
+      KAFKA_BROKER: kafka:9092
+      KAFKA_TOPIC: live_game_data
+      KAFKA_GROUP_ID: rt_transformer_group
+      DB_USER: statsuser
+      DB_PASSWORD: statspassword
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      DB_NAME: baseball_stats
+      # Add any other necessary env vars
+    networks:
+      - stats_network
+    restart: on-failure
+
+  api_service:
+    build:
+      context: ./api_service
+      dockerfile: Dockerfile
+    container_name: api_service
+    depends_on:
+      - postgres # API needs DB to be ready
+    ports:
+      - "8000:8000" # Map container port 8000 to host port 8000
+    environment:
+      DB_USER: statsuser
+      DB_PASSWORD: statspassword
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      DB_NAME: baseball_stats
+      # Add any other necessary env vars (e.g., for external APIs if needed)
+    networks:
+      - stats_network
+    restart: on-failure
