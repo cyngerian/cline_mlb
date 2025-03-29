@@ -1,3 +1,7 @@
 kafka-python
 SQLAlchemy
 psycopg2-binary
+
+# Testing
+pytest
+pytest-mock

@@ -126,7 +126,8 @@ def save_raw_json(data, game_pk):
             json.dump(data, f, ensure_ascii=False, indent=2) # Use indent=2 for smaller files
         # logger.debug(f"Saved raw data for game {game_pk} to {file_path}") # Use debug level
     except OSError as e:
-        logger.error(f"OS error saving raw JSON for game {game_pk} to {file_path}: {e}")
+        # Modify log message to not depend on file_path if makedirs failed
+        logger.error(f"OS error saving raw JSON for game {game_pk} (path: {game_path}): {e}")
     except Exception as e:
         logger.error(f"Unexpected error saving raw JSON for game {game_pk}: {e}")
 
