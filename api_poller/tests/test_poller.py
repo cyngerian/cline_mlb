@@ -7,8 +7,21 @@ from unittest.mock import MagicMock, patch # Using unittest.mock integrated with
 import sys
 import os
 # Add the parent directory (api_poller) to the Python path
+import datetime as dt # Import datetime for mocking
+# Add other imports from poller
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from poller import get_live_game_pks, get_game_feed
+from poller import (
+    get_live_game_pks,
+    get_game_feed,
+    create_kafka_producer,
+    send_to_kafka,
+    save_raw_json,
+    KAFKA_BROKER, # Import constants if needed for assertions
+    KAFKA_TOPIC,
+    RAW_DATA_PATH
+)
+from kafka import KafkaProducer # Import for type hinting if needed, or mocking
+from kafka.errors import KafkaError
 
 # --- Test Data ---
 MOCK_SCHEDULE_RESPONSE_LIVE = {
@@ -125,8 +138,185 @@ def test_get_game_feed_api_error(mock_get):
     mock_get.assert_called_once()
     assert feed_data is None # Should return None on error
 
+# --- Tests for create_kafka_producer ---
+
+@patch('poller.KafkaProducer') # Mock the KafkaProducer class itself
+def test_create_kafka_producer_success(MockKafkaProducer):
+    """Test successful Kafka producer creation."""
+    mock_producer_instance = MagicMock()
+    MockKafkaProducer.return_value = mock_producer_instance
+
+    producer = create_kafka_producer(retries=1) # Test with 1 retry for speed
+
+    MockKafkaProducer.assert_called_once_with(
+        bootstrap_servers=[KAFKA_BROKER],
+        value_serializer=pytest.approx(lambda v: json.dumps(v).encode('utf-8')), # Check serializer type
+        acks='all',
+        retries=3,
+        request_timeout_ms=30000
+    )
+    assert producer == mock_producer_instance
+
+@patch('poller.KafkaProducer')
+@patch('poller.time.sleep') # Mock time.sleep to avoid delays
+def test_create_kafka_producer_failure_then_success(mock_sleep, MockKafkaProducer):
+    """Test Kafka producer creation failing then succeeding."""
+    mock_producer_instance = MagicMock()
+    # Simulate failure on first call, success on second
+    MockKafkaProducer.side_effect = [KafkaError("Connection failed"), mock_producer_instance]
+
+    producer = create_kafka_producer(retries=2, delay=1)
+
+    assert MockKafkaProducer.call_count == 2
+    mock_sleep.assert_called_once_with(1) # Check if sleep was called
+    assert producer == mock_producer_instance
+
+@patch('poller.KafkaProducer')
+@patch('poller.time.sleep')
+def test_create_kafka_producer_persistent_failure(mock_sleep, MockKafkaProducer):
+    """Test Kafka producer creation failing after all retries."""
+    MockKafkaProducer.side_effect = KafkaError("Persistent connection failure")
+
+    producer = create_kafka_producer(retries=2, delay=1)
+
+    assert MockKafkaProducer.call_count == 2
+    assert mock_sleep.call_count == 2 # Called after each failure
+    assert producer is None
+
+# --- Tests for send_to_kafka ---
+
+def test_send_to_kafka_success():
+    """Test successfully sending a message to Kafka."""
+    mock_producer = MagicMock(spec=KafkaProducer)
+    mock_future = MagicMock()
+    mock_producer.send.return_value = mock_future
+    data = {"key": "value"}
+    game_pk = 12345
+
+    result = send_to_kafka(mock_producer, data, game_pk)
+
+    mock_producer.send.assert_called_once_with(
+        KAFKA_TOPIC,
+        key=str(game_pk).encode('utf-8'),
+        value=data
+    )
+    # If you were blocking with future.get(), you'd assert that too
+    assert result is True
+
+def test_send_to_kafka_producer_none():
+    """Test behavior when producer is None."""
+    result = send_to_kafka(None, {"key": "value"}, 12345)
+    assert result is False
+
+def test_send_to_kafka_empty_data():
+    """Test behavior with empty data."""
+    mock_producer = MagicMock(spec=KafkaProducer)
+    result = send_to_kafka(mock_producer, None, 12345)
+    mock_producer.send.assert_not_called()
+    assert result is False
+
+def test_send_to_kafka_kafka_error():
+    """Test handling KafkaError during send."""
+    mock_producer = MagicMock(spec=KafkaProducer)
+    mock_producer.send.side_effect = KafkaError("Send failed")
+    data = {"key": "value"}
+    game_pk = 12345
+
+    result = send_to_kafka(mock_producer, data, game_pk)
+
+    mock_producer.send.assert_called_once()
+    assert result is False
+
+@patch('poller.KafkaProducer.flush') # Mock flush specifically if needed
+def test_send_to_kafka_buffer_error(mock_flush):
+    """Test handling BufferError during send."""
+    mock_producer = MagicMock(spec=KafkaProducer)
+    mock_producer.send.side_effect = BufferError("Buffer full")
+    data = {"key": "value"}
+    game_pk = 12345
+
+    result = send_to_kafka(mock_producer, data, game_pk)
+
+    mock_producer.send.assert_called_once()
+    mock_flush.assert_called_once_with(timeout=5) # Check if flush was attempted
+    assert result is False
+
+
+# --- Tests for save_raw_json ---
+
+# Use pytest's tmp_path fixture for temporary directory
+@patch('poller.os.makedirs') # Mock os.makedirs
+@patch('builtins.open', new_callable=MagicMock) # Mock the built-in open function
+@patch('poller.datetime') # Mock datetime to control timestamp
+def test_save_raw_json_success(mock_datetime, mock_open, mock_makedirs, tmp_path):
+    """Test successfully saving JSON data."""
+    # Configure mocks
+    mock_file = MagicMock()
+    mock_open.return_value.__enter__.return_value = mock_file
+    fixed_time = dt.datetime(2024, 3, 30, 12, 0, 0)
+    mock_datetime.utcnow.return_value = fixed_time
+    expected_timestamp = fixed_time.strftime("%Y%m%d_%H%M%S%f")
+
+    # Override RAW_DATA_PATH for this test using tmp_path
+    with patch('poller.RAW_DATA_PATH', str(tmp_path)):
+        game_pk = 98765
+        data = {"gamePk": game_pk, "metaData": {"timeStamp": "API_TIMESTAMP"}, "liveData": {}}
+        expected_path = tmp_path / str(game_pk)
+        expected_filepath = expected_path / "API_TIMESTAMP.json" # Uses timestamp from data
+
+        save_raw_json(data, game_pk)
+
+        # Assertions
+        mock_makedirs.assert_called_once_with(expected_path, exist_ok=True)
+        mock_open.assert_called_once_with(expected_filepath, 'w', encoding='utf-8')
+        # Check if json.dump was called correctly on the mock file handle
+        mock_file.write.assert_called_once()
+        # More detailed check: parse the string written to the mock file
+        written_content = mock_file.write.call_args[0][0]
+        assert json.loads(written_content) == data
+
+@patch('poller.os.makedirs')
+@patch('builtins.open', new_callable=MagicMock)
+@patch('poller.datetime')
+def test_save_raw_json_uses_generated_timestamp(mock_datetime, mock_open, mock_makedirs, tmp_path):
+    """Test using generated timestamp when not present in metadata."""
+    mock_file = MagicMock()
+    mock_open.return_value.__enter__.return_value = mock_file
+    fixed_time = dt.datetime(2024, 3, 30, 12, 0, 1)
+    mock_datetime.utcnow.return_value = fixed_time
+    expected_timestamp = fixed_time.strftime("%Y%m%d_%H%M%S%f")
+
+    with patch('poller.RAW_DATA_PATH', str(tmp_path)):
+        game_pk = 98765
+        data = {"gamePk": game_pk, "metaData": {}, "liveData": {}} # No timeStamp
+        expected_path = tmp_path / str(game_pk)
+        expected_filepath = expected_path / f"{expected_timestamp}.json"
+
+        save_raw_json(data, game_pk)
+
+        mock_makedirs.assert_called_once_with(expected_path, exist_ok=True)
+        mock_open.assert_called_once_with(expected_filepath, 'w', encoding='utf-8')
+        mock_file.write.assert_called_once()
+
+def test_save_raw_json_no_data():
+    """Test behavior when data is None."""
+    # No mocks needed as it should exit early
+    save_raw_json(None, 123)
+    # Assert no file operations happened (implicitly tested by not mocking/asserting calls)
+
+@patch('poller.os.makedirs', side_effect=OSError("Permission denied"))
+def test_save_raw_json_os_error(mock_makedirs, tmp_path):
+    """Test handling OSError during makedirs."""
+    with patch('poller.RAW_DATA_PATH', str(tmp_path)):
+        game_pk = 98765
+        data = {"gamePk": game_pk, "metaData": {}, "liveData": {}}
+        # Expect function to catch OSError and log, not raise
+        save_raw_json(data, game_pk)
+        mock_makedirs.assert_called_once() # Ensure it was called
+
+# --- Tests for get_game_feed_json_error (Example of keeping existing tests) ---
 @patch('poller.requests.get')
-def test_get_game_feed_json_error(mock_get):
+def test_get_game_feed_json_error_existing(mock_get): # Renamed slightly to avoid conflict
     """Test handling JSON errors when fetching game feed."""
     game_pk = 745804
     mock_response = MagicMock()
