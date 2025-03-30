@@ -124,3 +124,13 @@ This document tracks the development status of the different components of the p
 *   Core data flow (API Poller -> MinIO/Kafka -> RT Transformer -> Postgres -> API Service) verified via backfill E2E test.
 *   Unit tests for `api_poller` and `rt_transformer` are passing after fixes.
 *   `api_service` and `airflow_dags` still require implementation and testing.
+
+---
+
+## 7. Use Case: Home Run Tracker
+
+*   **Purpose:** Develop features for a web application focused on tracking and analyzing home runs. See [USE_CASE_HR_TRACKER.md](USE_CASE_HR_TRACKER.md) for details.
+*   **Key Tasks (Phases):**
+    *   [ ] Phase 1: Core Play Data & API
+    *   [ ] Phase 2: Calculated Stats & API
+    *   [ ] Phase 3: Advanced Features & UI
