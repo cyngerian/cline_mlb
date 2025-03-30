@@ -12,7 +12,7 @@ import datetime as dt # Import datetime for mocking
 # Add other imports from poller
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from poller import (
-    get_live_game_pks,
+    get_game_pks_to_poll, # Renamed function
     get_game_feed,
     create_kafka_producer,
     send_to_kafka,
@@ -22,6 +22,7 @@ from poller import (
     fetch_with_retry, # Import the retry wrapper as well
     KAFKA_BROKER, # Import constants if needed for assertions
     KAFKA_TOPIC,
+    MLB_API_BASE_URL, # Import base URL constant
     # RAW_DATA_PATH # Constant removed
     S3_BUCKET_NAME # Import S3 constant
 )
@@ -67,11 +68,13 @@ MOCK_GAME_FEED_RESPONSE = {
 }
 
 # Mock data for S3 client creation test
+# Keys MUST match the environment variable names used in os.environ.get()
 MOCK_S3_CLIENT_CONFIG = {
-    'endpoint_url': 'http://minio:9000',
-    'aws_access_key_id': 'testkey',
-    'aws_secret_access_key': 'testsecret',
-    'region_name': 'us-east-1'
+    'S3_ENDPOINT_URL': 'http://minio:9000',
+    'S3_ACCESS_KEY': 'testkey',
+    'S3_SECRET_KEY': 'testsecret',
+    'S3_REGION': 'us-east-1',
+    'S3_BUCKET_NAME': 'test-bucket' # This key was already correct
 }
 
 # --- Tests for fetch_with_retry (Optional but good practice) ---
@@ -150,31 +153,68 @@ def test_fetch_with_retry_json_error(mock_sleep, mock_get):
     assert result is None
 
 
-# --- Tests for get_live_game_pks ---
+# --- Tests for get_game_pks_to_poll ---
 
 @patch('poller.fetch_with_retry') # Mock the retry wrapper now
-def test_get_live_game_pks_success(mock_fetch):
-    """Test successfully finding live game pks."""
+def test_get_game_pks_to_poll_live_success(mock_fetch):
+    """Test successfully finding live game pks in live mode."""
     mock_fetch.return_value = MOCK_SCHEDULE_RESPONSE_LIVE
-    live_pks = get_live_game_pks()
-    mock_fetch.assert_called_once()
+    # Call without date args for live mode
+    live_pks = get_game_pks_to_poll()
+    mock_fetch.assert_called_once() # Should fetch today's schedule
     assert live_pks == {745804} # Assert against a set
 
 @patch('poller.fetch_with_retry')
-def test_get_live_game_pks_no_live_games(mock_fetch):
-    """Test when the schedule API returns no live games."""
+def test_get_game_pks_to_poll_no_live_games(mock_fetch):
+    """Test when the schedule API returns no live games in live mode."""
     mock_fetch.return_value = MOCK_SCHEDULE_RESPONSE_NONE_LIVE
-    live_pks = get_live_game_pks()
+    # Call without date args for live mode
+    live_pks = get_game_pks_to_poll()
     mock_fetch.assert_called_once()
     assert live_pks == set() # Assert against an empty set
 
 @patch('poller.fetch_with_retry')
-def test_get_live_game_pks_fetch_error(mock_fetch):
-    """Test handling of fetch errors (retries handled within fetch_with_retry)."""
+def test_get_game_pks_to_poll_fetch_error(mock_fetch):
+    """Test handling of fetch errors in live mode."""
     mock_fetch.return_value = None # fetch_with_retry returns None on failure
-    live_pks = get_live_game_pks()
+    # Call without date args for live mode
+    live_pks = get_game_pks_to_poll()
     mock_fetch.assert_called_once()
     assert live_pks == set() # Should return empty set on error
+
+# Add tests for backfill mode
+@patch('poller.fetch_with_retry')
+def test_get_game_pks_to_poll_backfill_success(mock_fetch):
+    """Test fetching all games in backfill mode."""
+    start_date = "2024-03-28"
+    end_date = "2024-03-29"
+    # Mock response containing games across dates, including non-live
+    mock_response = {
+        "totalGames": 3,
+        "dates": [
+            {"date": "2024-03-28", "games": [{"gamePk": 745800, "status": {"abstractGameState": "Final"}}]},
+            {"date": "2024-03-29", "games": [
+                {"gamePk": 745804, "status": {"abstractGameState": "Live"}},
+                {"gamePk": 745805, "status": {"abstractGameState": "Preview"}}
+            ]}
+        ]
+    }
+    mock_fetch.return_value = mock_response
+    game_pks = get_game_pks_to_poll(start_date_str=start_date, end_date_str=end_date)
+    # Check fetch_with_retry was called with date parameters
+    expected_url = f"{MLB_API_BASE_URL}/schedule?sportId=1&gameType=R&gameType=F&gameType=D&gameType=L&gameType=W&gameType=A&startDate={start_date}&endDate={end_date}"
+    mock_fetch.assert_called_once_with(expected_url, ANY, timeout=ANY)
+    assert game_pks == {745800, 745804, 745805} # Should include all game pks
+
+@patch('poller.fetch_with_retry')
+def test_get_game_pks_to_poll_backfill_fetch_error(mock_fetch):
+    """Test handling fetch errors in backfill mode."""
+    start_date = "2024-03-28"
+    end_date = "2024-03-29"
+    mock_fetch.return_value = None # Simulate fetch failure
+    game_pks = get_game_pks_to_poll(start_date_str=start_date, end_date_str=end_date)
+    mock_fetch.assert_called_once()
+    assert game_pks == set() # Should return empty set on error
 
 # --- Tests for get_game_feed ---
 
@@ -296,30 +336,47 @@ def test_send_to_kafka_buffer_error():
 
 # --- Tests for create_s3_client ---
 
+# Helper function for patching environment variables via os.environ.get
+def mock_os_environ_get(env_vars):
+    def side_effect(key, default=None):
+        # Use the mocked bucket name if requested, otherwise fall back to default
+        if key == 'S3_BUCKET_NAME':
+            return env_vars.get(key, default)
+        return env_vars.get(key, default)
+    return side_effect
+
+@patch('poller.os.environ.get', side_effect=mock_os_environ_get(MOCK_S3_CLIENT_CONFIG))
 @patch('poller.boto3.client')
-def test_create_s3_client_success(mock_boto_client):
+def test_create_s3_client_success(mock_boto_client, mock_env_get):
     """Test successful S3 client creation and connection check."""
     mock_s3_instance = MagicMock()
     mock_boto_client.return_value = mock_s3_instance
     mock_s3_instance.head_bucket.return_value = {} # Simulate successful head_bucket
 
-    # Patch environment variables for the test duration
-    with patch.dict(os.environ, MOCK_S3_CLIENT_CONFIG, clear=True):
-        client = create_s3_client(retries=1)
+    client = create_s3_client(retries=1)
 
+    # Check os.environ.get was called for expected keys, matching the defaults used in the function
+    mock_env_get.assert_any_call('S3_ENDPOINT_URL') # No default specified in function call
+    mock_env_get.assert_any_call('S3_ACCESS_KEY') # No default specified in function call
+    mock_env_get.assert_any_call('S3_SECRET_KEY') # No default specified in function call
+    mock_env_get.assert_any_call('S3_BUCKET_NAME', 'baseball-stats-raw') # Default specified in function call
+    mock_env_get.assert_any_call('S3_REGION', 'us-east-1') # Default specified in function call
+
+    # Check boto3.client call with values from MOCK_S3_CLIENT_CONFIG
     mock_boto_client.assert_called_once_with(
         's3',
-        endpoint_url=MOCK_S3_CLIENT_CONFIG['endpoint_url'],
-        aws_access_key_id=MOCK_S3_CLIENT_CONFIG['aws_access_key_id'],
-        aws_secret_access_key=MOCK_S3_CLIENT_CONFIG['aws_secret_access_key'],
-        region_name=MOCK_S3_CLIENT_CONFIG['region_name']
+        endpoint_url=MOCK_S3_CLIENT_CONFIG['S3_ENDPOINT_URL'], # Corrected key
+        aws_access_key_id=MOCK_S3_CLIENT_CONFIG['S3_ACCESS_KEY'], # Corrected key
+        aws_secret_access_key=MOCK_S3_CLIENT_CONFIG['S3_SECRET_KEY'], # Corrected key
+        region_name=MOCK_S3_CLIENT_CONFIG['S3_REGION'] # Corrected key
     )
-    mock_s3_instance.head_bucket.assert_called_once_with(Bucket=S3_BUCKET_NAME)
+    mock_s3_instance.head_bucket.assert_called_once_with(Bucket=MOCK_S3_CLIENT_CONFIG.get('S3_BUCKET_NAME', 'baseball-stats-raw')) # Use mocked bucket name
     assert client == mock_s3_instance
 
+@patch('poller.os.environ.get', side_effect=mock_os_environ_get(MOCK_S3_CLIENT_CONFIG))
 @patch('poller.boto3.client')
 @patch('poller.time.sleep')
-def test_create_s3_client_retry_then_success(mock_sleep, mock_boto_client):
+def test_create_s3_client_retry_then_success(mock_sleep, mock_boto_client, mock_env_get):
     """Test S3 client creation succeeding after a retry."""
     mock_s3_instance = MagicMock()
     mock_s3_instance.head_bucket.return_value = {}
@@ -329,46 +386,50 @@ def test_create_s3_client_retry_then_success(mock_sleep, mock_boto_client):
         mock_s3_instance
     ]
 
-    with patch.dict(os.environ, MOCK_S3_CLIENT_CONFIG, clear=True):
-        client = create_s3_client(retries=2, delay=1)
+    client = create_s3_client(retries=2, delay=1)
 
     assert mock_boto_client.call_count == 2
     mock_sleep.assert_called_once_with(1)
+    assert mock_env_get.call_count > 0 # Ensure env vars were checked
     assert client == mock_s3_instance
 
+@patch('poller.os.environ.get', side_effect=mock_os_environ_get(MOCK_S3_CLIENT_CONFIG))
 @patch('poller.boto3.client')
 @patch('poller.time.sleep')
-def test_create_s3_client_no_such_bucket(mock_sleep, mock_boto_client):
+def test_create_s3_client_no_such_bucket(mock_sleep, mock_boto_client, mock_env_get):
     """Test S3 client creation when bucket doesn't exist."""
+    # Mock create_bucket on the instance returned by the client mock
     mock_s3_instance = MagicMock()
     mock_s3_instance.head_bucket.side_effect = ClientError(
-        {'Error': {'Code': 'NoSuchBucket', 'Message': 'Bucket does not exist'}},
-        'HeadBucket'
+        {'Error': {'Code': 'NoSuchBucket', 'Message': 'Bucket does not exist'}}, 'HeadBucket'
     )
+    mock_s3_instance.create_bucket.return_value = {} # Simulate successful creation
     mock_boto_client.return_value = mock_s3_instance
 
-    with patch.dict(os.environ, MOCK_S3_CLIENT_CONFIG, clear=True):
-        client = create_s3_client(retries=1)
+    client = create_s3_client(retries=1)
 
     mock_s3_instance.head_bucket.assert_called_once()
-    mock_sleep.assert_not_called() # Should not retry on NoSuchBucket by default
-    assert client is None
+    mock_s3_instance.create_bucket.assert_called_once_with(Bucket=MOCK_S3_CLIENT_CONFIG.get('S3_BUCKET_NAME', 'baseball-stats-raw'))
+    mock_sleep.assert_called_once_with(2) # Code sleeps for 2s after creating bucket
+    assert client == mock_s3_instance # Client should be returned after bucket creation
 
+@patch('poller.os.environ.get', side_effect=mock_os_environ_get(MOCK_S3_CLIENT_CONFIG)) # Patch env get for this test too
 @patch('poller.boto3.client')
 @patch('poller.time.sleep')
-def test_create_s3_client_auth_error(mock_sleep, mock_boto_client):
+def test_create_s3_client_auth_error(mock_sleep, mock_boto_client, mock_env_get): # Add mock_env_get
     """Test S3 client creation with authentication error."""
     mock_boto_client.side_effect = ClientError(
         {'Error': {'Code': 'InvalidAccessKeyId', 'Message': 'Invalid Key'}},
         'OperationName'
     )
 
-    with patch.dict(os.environ, MOCK_S3_CLIENT_CONFIG, clear=True):
-        client = create_s3_client(retries=2, delay=1)
+    # No need for patch.dict here anymore
+    client = create_s3_client(retries=2, delay=1)
 
     assert mock_boto_client.call_count == 2
     assert mock_sleep.call_count == 2 # Retries on auth error
     assert client is None
+    assert mock_env_get.call_count > 0 # Ensure env vars were checked
 
 
 # --- Tests for upload_to_s3 ---
@@ -386,10 +447,15 @@ def test_upload_to_s3_success():
     expected_key = f"{season}/{game_type}/{status}/{game_pk}/{timestamp}.json"
     expected_body = json.dumps(data, ensure_ascii=False, indent=2).encode('utf-8')
 
-    result = upload_to_s3(mock_s3_client, data, game_pk)
+    # Patch os.environ.get specifically for this test's scope if needed,
+    # or rely on default S3_BUCKET_NAME if MOCK_S3_CLIENT_CONFIG doesn't define it.
+    # Here, we assume the default 'baseball-stats-raw' is intended if not in mock.
+    test_bucket_name = MOCK_S3_CLIENT_CONFIG.get('S3_BUCKET_NAME', 'baseball-stats-raw')
+    with patch('poller.os.environ.get', side_effect=lambda k, d=None: test_bucket_name if k == 'S3_BUCKET_NAME' else os.environ.get(k, d)):
+         result = upload_to_s3(mock_s3_client, data, game_pk)
 
     mock_s3_client.put_object.assert_called_once_with(
-        Bucket=S3_BUCKET_NAME,
+        Bucket=test_bucket_name, # Use the potentially mocked bucket name
         Key=expected_key,
         Body=expected_body,
         ContentType='application/json'
@@ -425,10 +491,12 @@ def test_upload_to_s3_uses_generated_timestamp(mock_datetime):
     expected_key = f"{season}/{game_type}/{status}/{game_pk}/{expected_timestamp}.json"
     expected_body = json.dumps(data, ensure_ascii=False, indent=2).encode('utf-8')
 
-    result = upload_to_s3(mock_s3_client, data, game_pk)
+    test_bucket_name = MOCK_S3_CLIENT_CONFIG.get('S3_BUCKET_NAME', 'baseball-stats-raw')
+    with patch('poller.os.environ.get', side_effect=lambda k, d=None: test_bucket_name if k == 'S3_BUCKET_NAME' else os.environ.get(k, d)):
+        result = upload_to_s3(mock_s3_client, data, game_pk)
 
     mock_s3_client.put_object.assert_called_once_with(
-        Bucket=S3_BUCKET_NAME,
+        Bucket=test_bucket_name, # Use the potentially mocked bucket name
         Key=expected_key,
         Body=expected_body,
         ContentType='application/json'
@@ -445,7 +513,9 @@ def test_upload_to_s3_client_error():
     game_pk = MOCK_GAME_FEED_RESPONSE['gamePk']
     data = MOCK_GAME_FEED_RESPONSE
 
-    result = upload_to_s3(mock_s3_client, data, game_pk)
+    test_bucket_name = MOCK_S3_CLIENT_CONFIG.get('S3_BUCKET_NAME', 'baseball-stats-raw')
+    with patch('poller.os.environ.get', side_effect=lambda k, d=None: test_bucket_name if k == 'S3_BUCKET_NAME' else os.environ.get(k, d)):
+        result = upload_to_s3(mock_s3_client, data, game_pk)
 
     mock_s3_client.put_object.assert_called_once() # Check it was attempted
     assert result is False

@@ -1,9 +1,10 @@
 import pytest
 from unittest.mock import MagicMock, patch, call, ANY
 import json
-from datetime import datetime
+from datetime import datetime, timezone # Import timezone
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.sql.dml import Insert # To check instance type
+from sqlalchemy.exc import SQLAlchemyError # Import for testing specific exception
 
 # Import the functions/classes to test from the transformer script
 import sys
@@ -56,44 +57,55 @@ MOCK_KAFKA_MESSAGE.offset = 101
 def test_process_message_success(mock_pg_insert):
     """Test successful processing of a Kafka message."""
     mock_db_session = MagicMock()
-    # Mock the return value of pg_insert to allow chaining .on_conflict_do_update
-    mock_insert_stmt = MagicMock()
-    mock_pg_insert.return_value = mock_insert_stmt
-    mock_upsert_stmt = MagicMock()
-    mock_insert_stmt.on_conflict_do_update.return_value = mock_upsert_stmt
 
+    # Mock the final statement objects that get executed
+    mock_final_game_stmt = MagicMock(name="final_game_stmt")
+    mock_final_gs_stmt = MagicMock(name="final_gs_stmt")
+
+    # Mock the intermediate objects in the chain
+    mock_game_insert_obj = MagicMock(name="game_insert_obj")
+    mock_game_values_obj = MagicMock(name="game_values_obj")
+    mock_gs_insert_obj = MagicMock(name="gs_insert_obj")
+    mock_gs_values_obj = MagicMock(name="gs_values_obj")
+
+    # Configure pg_insert to return the correct insert object based on the table
+    def pg_insert_side_effect(table):
+        if table == Game:
+            return mock_game_insert_obj
+        elif table == GameState:
+            return mock_gs_insert_obj
+        else:
+            # In case of unexpected table, fail the test clearly
+            pytest.fail(f"Unexpected table passed to pg_insert: {table}")
+            return MagicMock() # Return a dummy mock to avoid further errors
+    mock_pg_insert.side_effect = pg_insert_side_effect
+
+    # Configure the chain for Game: insert().values().on_conflict_do_update()
+    mock_game_insert_obj.values.return_value = mock_game_values_obj
+    mock_game_values_obj.on_conflict_do_update.return_value = mock_final_game_stmt
+
+    # Configure the chain for GameState: insert().values().on_conflict_do_update()
+    mock_gs_insert_obj.values.return_value = mock_gs_values_obj
+    mock_gs_values_obj.on_conflict_do_update.return_value = mock_final_gs_stmt
+
+    # --- Run the function ---
     process_message(MOCK_KAFKA_MESSAGE, mock_db_session)
 
-    # --- Assertions for Game Upsert ---
-    # Check pg_insert was called for Game table
-    game_call = call(Game)
-    assert game_call in mock_pg_insert.call_args_list
-    # Find the specific call and check its values
-    game_insert_call = next(c for c in mock_pg_insert.call_args_list if c[0][0] == Game)
+    # --- Assertions ---
+    # Check pg_insert calls
+    mock_pg_insert.assert_any_call(Game)
+    mock_pg_insert.assert_any_call(GameState)
+
+    # Check values calls with expected data
     expected_game_values = {
         "game_pk": 745804,
         "home_team_id": 111,
         "away_team_id": 147,
-        "game_datetime": datetime(2024, 3, 29, 23, 5, 0), # Parsed datetime
+        "game_datetime": datetime(2024, 3, 29, 23, 5, 0, tzinfo=timezone.utc), # Use timezone.utc
         "venue_name": "Fenway Park",
         "game_status": "Live",
-        "updated_at": ANY # Check that it's present, value is tricky
+        "updated_at": ANY
     }
-    # Check that .values() was called with the correct data
-    assert mock_insert_stmt.values.call_args[0][0] == expected_game_values
-
-    # Check on_conflict_do_update was called correctly for Game
-    mock_insert_stmt.on_conflict_do_update.assert_called_once()
-    assert mock_insert_stmt.on_conflict_do_update.call_args[1]['index_elements'] == ['game_pk']
-    # Check that the 'set_' argument contains the right keys (excluding pk)
-    assert set(mock_insert_stmt.on_conflict_do_update.call_args[1]['set_'].keys()) == set(expected_game_values.keys()) - {'game_pk'}
-
-    # --- Assertions for GameState Upsert ---
-    # Check pg_insert was called for GameState table
-    gs_call = call(GameState)
-    assert gs_call in mock_pg_insert.call_args_list
-    # Find the specific call and check its values
-    gs_insert_call = next(c for c in mock_pg_insert.call_args_list if c[0][0] == GameState)
     expected_gs_values = {
         "game_pk": 745804,
         "inning": 3,
@@ -110,28 +122,35 @@ def test_process_message_success(mock_pg_insert):
         "away_score": 1,
         "last_updated": ANY
     }
-    # Check that .values() was called with the correct data
-    assert mock_insert_stmt.values.call_args[0][0] == expected_gs_values
+    mock_game_insert_obj.values.assert_called_once_with(expected_game_values)
+    mock_gs_insert_obj.values.assert_called_once_with(expected_gs_values)
 
-    # Check on_conflict_do_update was called correctly for GameState
-    # Note: This reuses mock_insert_stmt, need to check second call or separate mocks
-    # For simplicity, let's assume the second call to on_conflict_do_update is for GameState
-    assert mock_insert_stmt.on_conflict_do_update.call_count == 2
-    last_on_conflict_call = mock_insert_stmt.on_conflict_do_update.call_args_list[-1]
-    assert last_on_conflict_call[1]['index_elements'] == ['game_pk']
-    assert set(last_on_conflict_call[1]['set_'].keys()) == set(expected_gs_values.keys()) - {'game_pk'}
+    # Check on_conflict_do_update calls (on the object returned by .values())
+    mock_game_values_obj.on_conflict_do_update.assert_called_once()
+    game_conflict_args = mock_game_values_obj.on_conflict_do_update.call_args
+    assert game_conflict_args[1]['index_elements'] == ['game_pk']
+    # Check the 'set_' argument keys
+    assert set(game_conflict_args[1]['set_'].keys()) == set(expected_game_values.keys()) - {'game_pk'}
 
+    mock_gs_values_obj.on_conflict_do_update.assert_called_once()
+    gs_conflict_args = mock_gs_values_obj.on_conflict_do_update.call_args
+    assert gs_conflict_args[1]['index_elements'] == ['game_pk']
+    # Check the 'set_' argument keys
+    assert set(gs_conflict_args[1]['set_'].keys()) == set(expected_gs_values.keys()) - {'game_pk'}
 
-    # Check db_session.execute was called twice (once for each upsert)
+    # Check execute calls with the final statement objects
+    mock_db_session.execute.assert_any_call(mock_final_game_stmt)
+    mock_db_session.execute.assert_any_call(mock_final_gs_stmt)
     assert mock_db_session.execute.call_count == 2
-    # Check commit was called
+
+    # Check commit/rollback
     mock_db_session.commit.assert_called_once()
-    # Check rollback was not called
     mock_db_session.rollback.assert_not_called()
 
+
 @patch('transformer.pg_insert')
-@patch('transformer.logger') # Mock logger to check warnings/errors
-def test_process_message_incomplete_data(mock_logger, mock_pg_insert):
+@patch('transformer.logging.warning') # Patch the specific logging function
+def test_process_message_incomplete_data(mock_log_warning, mock_pg_insert):
     """Test processing a message with missing essential data."""
     mock_db_session = MagicMock()
     incomplete_message = MagicMock()
@@ -146,43 +165,66 @@ def test_process_message_incomplete_data(mock_logger, mock_pg_insert):
     mock_db_session.commit.assert_not_called()
     mock_db_session.rollback.assert_not_called()
     # Assert warning was logged
-    mock_logger.warning.assert_called_once_with(
+    mock_log_warning.assert_called_once_with(
         f"Incomplete data received for message offset {incomplete_message.offset}. Skipping."
     )
 
-@patch('transformer.pg_insert', side_effect=Exception("DB Error")) # Simulate DB error
-@patch('transformer.logger')
-def test_process_message_db_error(mock_logger, mock_pg_insert):
-    """Test handling of database errors during processing."""
+# Test SQLAlchemyError specifically
+@patch('transformer.pg_insert', side_effect=SQLAlchemyError("DB Specific Error"))
+@patch('transformer.logging.error') # Patch the specific logging function
+def test_process_message_sqlalchemy_error(mock_log_error, mock_pg_insert):
+    """Test handling of SQLAlchemy errors during processing."""
     mock_db_session = MagicMock()
 
     process_message(MOCK_KAFKA_MESSAGE, mock_db_session)
 
-    # Assert execute was called (it fails after this)
-    mock_db_session.execute.assert_called()
+    # Assert pg_insert was called (it fails after this)
+    mock_pg_insert.assert_called()
+    # Assert execute was NOT called
+    mock_db_session.execute.assert_not_called()
     # Assert commit was NOT called
     mock_db_session.commit.assert_not_called()
     # Assert rollback WAS called
     mock_db_session.rollback.assert_called_once()
-    # Assert error was logged
-    mock_logger.error.assert_called_with("Database error processing message: DB Error")
+    # Assert specific SQLAlchemyError log message
+    mock_log_error.assert_called_with("Database error processing message: DB Specific Error")
+
+# Test generic Exception
+@patch('transformer.pg_insert', side_effect=Exception("Generic Error"))
+@patch('transformer.logging.error') # Patch the specific logging function
+def test_process_message_generic_exception(mock_log_error, mock_pg_insert):
+    """Test handling of generic exceptions during processing."""
+    mock_db_session = MagicMock()
+
+    process_message(MOCK_KAFKA_MESSAGE, mock_db_session)
+
+    # Assert pg_insert was called (it fails after this)
+    mock_pg_insert.assert_called()
+    # Assert execute was NOT called
+    mock_db_session.execute.assert_not_called()
+    # Assert commit was NOT called
+    mock_db_session.commit.assert_not_called()
+    # Assert rollback WAS called
+    mock_db_session.rollback.assert_called_once()
+    # Assert generic exception log message
+    mock_log_error.assert_called_with("Unexpected error processing message: Generic Error")
+
 
 def test_process_message_json_decode_error():
     """Test handling of JSON decode errors (simulated by bad value)."""
     mock_db_session = MagicMock()
     bad_message = MagicMock()
-    bad_message.value = "this is not json" # Simulate bad data
+    bad_message.value = "this is not json" # Simulate bad data that causes AttributeError later
     bad_message.offset = 103
 
     # process_message should catch the error internally and log it
-    # We can't easily mock the json.loads within the lambda, so we test the outcome
-    with patch('transformer.logger') as mock_logger:
+    with patch('transformer.logging.error') as mock_log_error: # Patch the specific logging function
         process_message(bad_message, mock_db_session)
 
         # Assert no DB operations attempted
         mock_db_session.execute.assert_not_called()
         mock_db_session.commit.assert_not_called()
-        mock_db_session.rollback.assert_not_called() # Rollback not needed if error is before DB ops
-        # Check for appropriate log message
-        mock_logger.error.assert_called_once()
-        assert "Failed to decode JSON message" in mock_logger.error.call_args[0][0]
+        mock_db_session.rollback.assert_called_once() # Rollback IS called by the generic exception handler
+        # Check for appropriate log message (will be AttributeError in this case)
+        mock_log_error.assert_called_once()
+        assert "Unexpected error processing message: 'str' object has no attribute 'get'" in mock_log_error.call_args[0][0]

@@ -28,14 +28,15 @@ This document tracks the development status of the different components of the p
     *   [x] Fetch live game feed (`/feed/live`)
     *   [x] Save raw JSON to volume
     *   [x] Publish data to Kafka (`live_game_data` topic)
+    *   [x] Add `--backfill-days` argument for fetching past game data
     *   [ ] Implement robust error handling and retries for API calls
     *   [ ] Implement robust error handling for Kafka connection/publishing
     *   [ ] Add configuration options (e.g., poll intervals via env vars) - *Partially done*
     *   [ ] Add comprehensive logging
 *   **Testing Status:**
-    *   Tests Written: No
-    *   Tests Passing: N/A
-    *   Coverage: N/A
+    *   Tests Written: Yes (Unit & Integration)
+    *   Tests Passing: Yes
+    *   Coverage: N/A (Not configured yet)
 
 ---
 
@@ -55,9 +56,9 @@ This document tracks the development status of the different components of the p
     *   [ ] Add comprehensive logging
     *   [ ] Populate `Teams` and `Players` tables (or ensure they are populated elsewhere)
 *   **Testing Status:**
-    *   Tests Written: No
-    *   Tests Passing: N/A
-    *   Coverage: N/A
+    *   Tests Written: Yes (Unit)
+    *   Tests Passing: Yes
+    *   Coverage: N/A (Not configured yet)
 
 ---
 
@@ -115,3 +116,11 @@ This document tracks the development status of the different components of the p
 
 ---
 *Status Key: [ ] Not Started, [/] In Progress, [x] Completed*
+
+---
+
+## Overall Status Notes
+
+*   Core data flow (API Poller -> MinIO/Kafka -> RT Transformer -> Postgres -> API Service) verified via backfill E2E test.
+*   Unit tests for `api_poller` and `rt_transformer` are passing after fixes.
+*   `api_service` and `airflow_dags` still require implementation and testing.

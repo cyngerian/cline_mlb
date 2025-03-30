@@ -19,8 +19,12 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the application code
+# Copy the rest of the application code including the entrypoint script
 COPY . .
 
-# Command to run the application
-CMD ["python", "poller.py"]
+# Make the entrypoint script executable
+RUN chmod +x entrypoint.sh
+
+# Command to run the entrypoint script (exec form)
+# This will run wait-for-minio.py and then poller.py by default
+CMD ["./entrypoint.sh"]
